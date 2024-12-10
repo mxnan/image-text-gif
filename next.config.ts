@@ -1,6 +1,28 @@
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
+  webpack: (config, { isServer }) => {
+    // Add Web Worker support
+    config.module.rules.push({
+      test: /\.worker\.(js|ts)$/,
+      use: {
+        loader: 'worker-loader',
+        options: {
+          filename: 'static/[hash].worker.js',
+          publicPath: '/_next/',
+        },
+      },
+    });
+
+    // Support for modern-gif worker
+    config.module.rules.push({
+      test: /\.ts$/,
+      include: /node_modules\/modern-gif/,
+      type: 'asset/resource',
+    });
+
+    return config;
+  },
   /* config options here */
   async headers() {
     return [

@@ -1,7 +1,5 @@
 /* eslint-disable @typescript-eslint/no-unused-vars */
 import { useState, useCallback } from "react";
-import { encode } from "modern-gif";
-
 import { toast } from "sonner";
 
 import { TextSet } from "@/types/text";
@@ -32,153 +30,95 @@ export function useGifGenerator() {
     return easingFunction(progress);
   };
 
-  const applyAnimationProperties = (
-    ctx: CanvasRenderingContext2D,
-    textSet: TextSet,
-    frameIndex: number,
-    TOTAL_FRAMES: number
-  ) => {
-    const animationType = textSet.animation?.type || "fadeIn";
-    const config = ANIMATION_REGISTRY[animationType];
-
-    if (!config) return;
-
-    const progress = calculateAnimationProgress(
-      frameIndex,
-      TOTAL_FRAMES,
-      config
-    );
-    const properties = config.properties;
-
-    // Calculate all transformations first
-    let opacity = textSet.opacity;
-    let scaleValue = 1;
-    let translateX = 0;
-    let translateY = 0;
-    let rotationValue = textSet.rotation;
-
-    Object.entries(properties).forEach(([key, [start, end]]) => {
-      const value = start + (end - start) * progress;
-
-      switch (key) {
-        case "opacity":
-          opacity *= value;
-          break;
-        case "scale":
-          scaleValue = value;
-          break;
-        case "y":
-          translateY = value;
-          break;
-        case "x":
-          translateX = value;
-          break;
-        case "rotation":
-          rotationValue += value;
-          break;
-      }
-    });
-    // Apply transformations in the correct order
-    ctx.globalAlpha = opacity;
-    ctx.translate(translateX, translateY);
-    ctx.scale(scaleValue, scaleValue);
-    ctx.rotate((rotationValue * Math.PI) / 180);
-  };
-
   const generateGif = useCallback(async (options: GifOptions) => {
     setIsGenerating(true);
 
     try {
-      // Load images at full resolution
-      const [baseImage, bgRemovedImage] = await Promise.all(
-        options.images.map(async (imgUrl) => {
+      // Load base image at full resolution
+      const baseImage = await new Promise<HTMLImageElement>(
+        (resolve, reject) => {
           const img = new Image();
           img.crossOrigin = "anonymous";
-          await new Promise((resolve, reject) => {
-            img.onload = resolve;
-            img.onerror = reject;
-            img.src = imgUrl;
-          });
-          return img;
-        })
+          img.onload = () => resolve(img);
+          img.onerror = reject;
+          img.src = options.images[0];
+        }
       );
 
-      // Use original image dimensions
+      // Create temporary canvas to get image data
       const canvas = document.createElement("canvas");
       canvas.width = baseImage.naturalWidth;
       canvas.height = baseImage.naturalHeight;
 
       const ctx = canvas.getContext("2d", {
         willReadFrequently: true,
-        alpha: false,
       });
       if (!ctx) throw new Error("Failed to get canvas context");
 
-      // Scale text properties relative to original dimensions
-      const scaleTextProperties = (textSet: TextSet) => {
-        const scaleFactor = baseImage.naturalWidth / options.previewWidth;
-        return {
-          ...textSet,
-          fontSize: Math.round(textSet.fontSize * scaleFactor),
+      // Draw base image to get its data
+      ctx.drawImage(baseImage, 0, 0);
+      
+      // Convert the image to a blob first
+      const blob = await new Promise<Blob>((resolve) => {
+        canvas.toBlob((b) => resolve(b!), 'image/png', 1.0);
+      });
+      
+      // Convert blob to array buffer
+      const imageBuffer = await blob.arrayBuffer();
+
+      // Create a new worker instance
+      const worker = new Worker(
+        new URL("../utils/gif-worker.ts", import.meta.url)
+      );
+
+      const gifBlob = await new Promise<Blob>((resolve, reject) => {
+        worker.onmessage = (event) => {
+          const { type, data, error } = event.data;
+          if (type === "error") {
+            reject(new Error(error));
+            return;
+          }
+          resolve(data);
         };
-      };
 
-      // Generate frames with scaled text
-      const frames: { data: Uint8ClampedArray; delay: number }[] = [];
-      const TOTAL_FRAMES = 60;
-      const FRAME_DELAY = 40;
+        worker.onerror = (error) => {
+          reject(new Error(error.message));
+        };
 
-      for (let frameIndex = 0; frameIndex < TOTAL_FRAMES; frameIndex++) {
-        ctx.clearRect(0, 0, canvas.width, canvas.height);
-        ctx.drawImage(baseImage, 0, 0, canvas.width, canvas.height);
+        // Calculate scale factor for text
+        const scaleFactor = baseImage.naturalWidth / options.previewWidth;
 
-        // Scale and sort text by zIndex
-        const scaledTextData = options.textData
-          .map(scaleTextProperties)
-          .sort((a, b) => a.zIndex - b.zIndex);
-
-        // Draw each text with animation
-        scaledTextData.forEach((textSet) => {
-          ctx.save();
-
-          // Calculate positions relative to original dimensions
-          const x = canvas.width * (textSet.left / 100);
-          const y = canvas.height * (textSet.top / 100);
-
-          ctx.translate(x, y);
-          applyAnimationProperties(ctx, textSet, frameIndex, TOTAL_FRAMES);
-
-          // Apply text properties
-          ctx.font = `${textSet.fontWeight} ${textSet.fontSize}px ${textSet.fontFamily}`;
-          ctx.fillStyle = textSet.color;
-          ctx.textAlign = "center";
-          ctx.textBaseline = "middle";
-          ctx.fillText(textSet.text, 0, 0);
-
-          ctx.restore();
-        });
-
-        // Draw background removed image if exists
-        if (bgRemovedImage) {
-          ctx.drawImage(bgRemovedImage, 0, 0, canvas.width, canvas.height);
-        }
-
-        const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-        frames.push({ data: imageData.data, delay: FRAME_DELAY });
-      }
-
-      // Generate high-quality GIF
-      const output = await encode({
-        width: canvas.width,
-        height: canvas.height,
-        frames,
-        // maxColors: 256, // Maximum color palette for better quality
-        format: "blob",
-        
+        // Send data to worker
+        worker.postMessage(
+          {
+            type: "generate",
+            width: canvas.width,
+            height: canvas.height,
+            imageData: imageBuffer,
+            animationConfig: {
+              duration: 2, // 2 seconds animation
+              fps: 30, // 30 frames per second
+              textData: options.textData.map((text) => ({
+                ...text,
+                fontSize: Math.round(text.fontSize * scaleFactor),
+                left: canvas.width * (text.left / 100),
+                top: canvas.height * (text.top / 100),
+              })),
+            },
+            options: {
+              maxColors: 256,
+              quality: 10,
+              dither: false,
+            },
+          },
+          [imageBuffer]
+        );
       });
 
-      const blob = new Blob([output], { type: "image/gif" });
-      const gifUrl = URL.createObjectURL(blob);
+      // Clean up
+      worker.terminate();
+
+      const gifUrl = URL.createObjectURL(gifBlob);
       setGeneratedGif(gifUrl);
       return gifUrl;
     } catch (error) {
@@ -188,7 +128,6 @@ export function useGifGenerator() {
     } finally {
       setIsGenerating(false);
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   return { generateGif, isGenerating, generatedGif, setGeneratedGif };
